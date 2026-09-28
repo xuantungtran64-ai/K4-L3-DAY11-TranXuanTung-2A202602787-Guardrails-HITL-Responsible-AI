@@ -25,7 +25,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(_ROOT / ".env")
+    load_dotenv(_ROOT / ".env", override=True)
 except ImportError:
     pass
 
@@ -36,7 +36,7 @@ PROVIDER_OPENROUTER = "openrouter"
 
 # --- Blue Team (LOCKED) ---
 BLUE_PROVIDER = PROVIDER_OPENROUTER
-BLUE_MODEL = "liquid/lfm-2.5-2.6b"
+BLUE_MODEL = "liquid/lfm-2.5-2.6b:free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = BLUE_MODEL  # alias
 
@@ -240,7 +240,7 @@ def setup_api_key():
         os.environ["OPENROUTER_API_KEY"] = input(
             "Enter OpenRouter API Key (Blue): "
         ).strip()
-    print(f"Blue  — {blue_provider_label()}  [LOCKED]")
+    print(f"Read  — {blue_provider_label()}  [LOCKED]")
 
     red = get_red_provider()
     model = get_red_model()

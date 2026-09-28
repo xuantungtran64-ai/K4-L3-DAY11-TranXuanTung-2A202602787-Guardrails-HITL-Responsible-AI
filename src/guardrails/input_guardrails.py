@@ -11,7 +11,15 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import sys
+import unicodedata
+from pathlib import Path
 from typing import Literal
+
+# Ensure src is in sys.path when running file directly
+_SRC_DIR = Path(__file__).resolve().parent.parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 from google.genai import types
 from google.adk.plugins import base_plugin
@@ -21,6 +29,30 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+# Zero-width and invisible unicode characters used in obfuscation
+_ZERO_WIDTH_CHARS = r"[\u200b\u200c\u200d\u200e\u200f\ufeff\u2060\u00ad]"
+
+
+def _canonicalize_text(text: str) -> tuple[str, str]:
+    """Canonicalize Unicode (NFKC) and handle zero-width/invisible spacing.
+
+    Returns:
+        (text_with_spaces_at_zero_width, text_with_zero_width_stripped)
+    """
+    normalized = unicodedata.normalize("NFKC", text or "")
+    spaced = re.sub(_ZERO_WIDTH_CHARS, " ", normalized)
+    spaced = re.sub(r"\s+", " ", spaced).strip()
+    stripped = re.sub(_ZERO_WIDTH_CHARS, "", normalized)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    return spaced, stripped
+
+
+def _strip_accents(text: str) -> str:
+    """Remove Vietnamese diacritics / accents for robust matching."""
+    nfkd = unicodedata.normalize("NFKD", text or "")
+    stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return stripped.replace("đ", "d").replace("Đ", "D")
 
 
 # ============================================================
@@ -52,13 +84,39 @@ def detect_injection(user_input: str) -> InputStatus:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        # Instruction overrides / ignore instructions
+        r"ignore\s+(all\s+)?(previous|above|prior)?\s*instructions?",
+        r"disregard\s+(all\s+)?(previous|above|prior)?\s*(instructions?|rules?|directives?)",
+        r"forget\s+(your\s+)?(all\s+)?(instructions?|rules?|prompt)",
+        r"override\s+(your\s+)?(system\s+)?(prompt|instructions?)",
+        # Identity / role hijacking
+        r"you\s+are\s+now\b",
+        r"\bDAN\b",
+        r"pretend\s+(you\s+are|to\s+be)",
+        r"act\s+as\s+(a\s+|an\s+)?(unrestricted|evil|jailbroken)",
+        r"role\s*play\s+as",
+        # Prompt / secret exfiltration
+        r"system\s+prompt",
+        r"reveal\s+(your\s+|the\s+)?(instructions?|prompt|system\s+prompt|secrets?|password|api\s*key)",
+        r"show\s+(me\s+)?(your\s+|the\s+)?(system\s+)?(prompt|instructions?|config|password|secret)",
+        r"output\s+(your\s+)?(system\s+)?(prompt|instructions?|rules?)",
+        # Bypasses & jailbreaks
+        r"jailbreak",
+        r"bypass\s+.*(guardrails?|filter|restrictions?)",
+        # Vietnamese injection patterns
+        r"bỏ\s+qua\s+(mọi\s+)?hướng\s+dẫn",
+        r"quên\s+(mọi\s+)?hướng\s+dẫn",
+        r"tiết\s+lộ\s+(mật\s+khẩu|api|system\s*prompt)",
+        r"cho\s+tôi\s+(xem\s+)?(mật\s+khẩu|system\s*prompt|api\s*key)",
+        r"bạn\s+là\s+DAN\b",
     ]
 
+    spaced, stripped = _canonicalize_text(user_input)
+    unaccented = _strip_accents(spaced)
+
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        compiled = re.compile(pattern, re.IGNORECASE)
+        if compiled.search(spaced) or compiled.search(stripped) or compiled.search(unaccented):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +142,32 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    spaced, _ = _canonicalize_text(user_input)
+    input_lower = spaced.lower()
+    input_unaccented = _strip_accents(input_lower)
 
-    # TODO: Implement logic:
     # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    for blocked in BLOCKED_TOPICS:
+        pattern = rf"\b{re.escape(blocked)}"
+        if re.search(pattern, input_lower) or re.search(pattern, input_unaccented):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
+    def _matches_topic(topic: str, text: str) -> bool:
+        if " " in topic:
+            return topic in text
+        stem = topic[:-1] if topic.endswith("s") and len(topic) > 4 else topic
+        return bool(re.search(rf"\b{re.escape(stem)}", text))
+
+    has_allowed = any(
+        _matches_topic(topic, input_lower) or _matches_topic(topic, input_unaccented)
+        for topic in ALLOWED_TOPICS
+    )
+    if not has_allowed:
+        return "BLOCK"
+
+    # 3. Otherwise -> return "ALLOW"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +220,22 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
         # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked: prompt injection or unsafe pattern detected."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Call topic_filter(text)
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked: input is off-topic or outside VinBank banking scope."
+            )
+
+        # 3. If both return "ALLOW": return None (let message through)
+        return None
 
 
 # ============================================================
